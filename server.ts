@@ -1,229 +1,313 @@
 // bb-plugin-read-aloud — backend.
 //
-// One job: turn the text of a chat message into spoken audio.
+// Speaks the text of a chat message. The plugin server runs inside the BB
+// server container, so it cannot reach a speech engine on the user's machine:
+// host.ts does that, and this file decides what to say, in what pieces, and by
+// which route.
 //
-// BB has no text-to-speech of its own, and the ChatGPT subscription token is
-// not admitted to OpenAI's /v1/audio/speech endpoint (it answers 401 "Missing
-// scopes: api.model.audio.request"). So this plugin speaks through the OpenAI
-// platform API with the user's own key, which also means it works for anyone
-// who installs it — no Codex login required.
+// Default route is a local Piper engine (MIT) on the user's own machine — no
+// key, no account, no text leaving the machine. OpenAI is an opt-in
+// alternative. A ChatGPT subscription cannot be used for either: OpenAI
+// refuses subscription tokens at its speech endpoint with
+// "Missing scopes: api.model.audio.request".
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import {
+  AUDIO_FORMATS,
+  hostContract,
+  MAX_CHUNK_CHARS,
+  type AudioFormat,
+} from "./contract.js";
+import {
+  normalizeForSpeech,
+  speakableText,
+  splitForSpeech,
+} from "./text.ts";
 
-const SPEECH_ENDPOINT = "https://api.openai.com/v1/audio/speech";
+const OPENAI_SPEECH_ENDPOINT = "https://api.openai.com/v1/audio/speech";
 
-/** OpenAI rejects an input longer than this, so long messages are split. */
-const MAX_INPUT_CHARS = 4000;
-
-/** Refuse absurd inputs outright rather than spending minutes of audio on them. */
+/** Refuse absurd inputs rather than spending minutes of audio on them. */
 const MAX_TOTAL_CHARS = 40_000;
 
-const REQUEST_TIMEOUT_MS = 120_000;
+/** OpenAI accepts far more per request than one host RPC call can carry. */
+const OPENAI_MAX_CHARS = 4_000;
 
-export const VOICES = [
-  "alloy",
-  "ash",
-  "ballad",
-  "coral",
-  "echo",
-  "fable",
-  "nova",
-  "onyx",
-  "sage",
-  "shimmer",
-  "verse",
-] as const;
-
-export const MODELS = ["gpt-4o-mini-tts", "tts-1-hd", "tts-1"] as const;
+export const SOURCES = ["local", "openai"] as const;
+export type Source = (typeof SOURCES)[number];
 
 export const rpcContract = defineRpcContract({
-  /** Speak one message. Returns base64 MP3 the frontend plays directly. */
-  speak: {
+  /** Split a message into speakable pieces and confirm a route exists. */
+  prepare: {
     input: z
-      .object({ text: z.string().min(1).max(MAX_TOTAL_CHARS) })
+      .object({
+        text: z.string().min(1).max(MAX_TOTAL_CHARS),
+        threadId: z.string().nullable(),
+      })
+      .strict(),
+    output: z
+      .object({
+        chunks: z.array(z.string()),
+        source: z.enum(SOURCES),
+        voice: z.string(),
+      })
+      .strict(),
+  },
+  /** Speak one piece. Base64 because RPC carries JSON, not binary. */
+  speakChunk: {
+    input: z
+      .object({
+        chunk: z.string().min(1),
+        threadId: z.string().nullable(),
+        format: z.enum(AUDIO_FORMATS),
+      })
       .strict(),
     output: z
       .object({
         audioBase64: z.string(),
         mimeType: z.string(),
-        /** Characters actually spoken, after stripping markdown noise. */
-        spokenChars: z.number().int().nonnegative(),
+        cached: z.boolean(),
       })
       .strict(),
   },
-  /** Whether a key is configured, so the frontend can say so precisely. */
+  /** Which route is configured and whether it currently answers. */
   status: {
-    input: z.null(),
+    input: z.object({ threadId: z.string().nullable() }).strict(),
     output: z
-      .object({ configured: z.boolean(), voice: z.string(), model: z.string() })
+      .object({
+        source: z.enum(SOURCES),
+        ready: z.boolean(),
+        voice: z.string(),
+        voices: z.array(z.string()),
+        message: z.string().nullable(),
+      })
       .strict(),
   },
 });
-
-/**
- * Strip the markdown that reads badly aloud while keeping every word.
- * Fenced code blocks are dropped outright — a voice reading YAML helps nobody.
- */
-export function speakableText(raw: string): string {
-  return raw
-    .replace(/```[\s\S]*?```/gu, " ")
-    .replace(/`([^`]+)`/gu, "$1")
-    .replace(/!\[[^\]]*\]\([^)]*\)/gu, " ")
-    .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
-    .replace(/^\s{0,3}#{1,6}\s+/gmu, "")
-    .replace(/^\s{0,3}>\s?/gmu, "")
-    .replace(/^\s{0,3}[-*+]\s+/gmu, "")
-    .replace(/(\*\*|__)(.*?)\1/gu, "$2")
-    .replace(/(\*|_)(.*?)\1/gu, "$2")
-    .replace(/^\s*\|.*\|\s*$/gmu, " ")
-    .replace(/^\s*[-:|\s]+$/gmu, " ")
-    .replace(/\n{3,}/gu, "\n\n")
-    .replace(/[ \t]{2,}/gu, " ")
-    .trim();
-}
-
-/**
- * Split into pieces OpenAI will accept, preferring paragraph then sentence
- * boundaries so the seam between two audio chunks lands where a reader would
- * pause anyway. A single unbroken run longer than the limit is hard-cut.
- */
-export function splitForSpeech(text: string, limit = MAX_INPUT_CHARS): string[] {
-  if (text.length <= limit) return text.length > 0 ? [text] : [];
-  const chunks: string[] = [];
-  let rest = text;
-  while (rest.length > limit) {
-    const window = rest.slice(0, limit);
-    const seam = Math.max(
-      window.lastIndexOf("\n\n"),
-      window.lastIndexOf(". "),
-      window.lastIndexOf("! "),
-      window.lastIndexOf("? "),
-      window.lastIndexOf("\n"),
-    );
-    const cut = seam > limit * 0.5 ? seam + 1 : limit;
-    chunks.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut);
-  }
-  const tail = rest.trim();
-  if (tail.length > 0) chunks.push(tail);
-  return chunks.filter((chunk) => chunk.length > 0);
-}
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
   const settings = bb.settings.define({
+    source: {
+      type: "select",
+      label: "Speech source",
+      description:
+        "Local engine runs on your own machine: no key, no account, and the text never leaves it. OpenAI is billed to your own API key.",
+      options: [...SOURCES],
+      default: "local",
+    },
+    voice: {
+      type: "string",
+      label: "Voice",
+      description:
+        "Local engine: a Piper voice id such as ru_RU-dmitri-medium. OpenAI: one of alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer, verse.",
+      default: "ru_RU-dmitri-medium",
+    },
+    rate: {
+      type: "string",
+      label: "Speed",
+      description: "1 is normal. Half speed is 0.5, double is 2.",
+      default: "1.0",
+    },
+    engineUrl: {
+      type: "string",
+      label: "Local engine address",
+      description:
+        "Where the engine listens on your machine. Change this only if you moved it off the default port.",
+      default: "http://127.0.0.1:5077",
+    },
+    machineId: {
+      type: "string",
+      label: "Machine (optional)",
+      description:
+        "Leave blank to use the machine the open thread runs on. Set a host id to pin every reading to one machine.",
+      default: "",
+    },
     openaiApiKey: {
       type: "string",
       secret: true,
       label: "OpenAI API key",
       description:
-        "Needed to speak. A ChatGPT subscription cannot be used here: OpenAI does not admit subscription tokens to its speech endpoint. Create a key at platform.openai.com.",
+        "Only used when the source above is set to OpenAI. A ChatGPT subscription cannot be used: OpenAI refuses subscription tokens at its speech endpoint.",
       default: "",
     },
-    voice: {
+    openaiModel: {
       type: "select",
-      label: "Voice",
-      description: "Preview every voice at platform.openai.com/docs/guides/text-to-speech.",
-      options: [...VOICES],
-      default: "alloy",
-    },
-    model: {
-      type: "select",
-      label: "Model",
-      description:
-        "gpt-4o-mini-tts is the current, cheapest and most expressive model, and the only one that follows the reading-style instructions below.",
-      options: [...MODELS],
+      label: "OpenAI model",
+      options: ["gpt-4o-mini-tts", "tts-1-hd", "tts-1"],
       default: "gpt-4o-mini-tts",
     },
-    instructions: {
+    openaiInstructions: {
       type: "string",
-      label: "Reading style",
+      label: "OpenAI reading style",
       description:
-        "Plain-language direction for how to read, e.g. \"calm, unhurried, like a colleague explaining\". Used by gpt-4o-mini-tts only.",
+        "Plain-language direction, e.g. \"calm, unhurried\". Followed by gpt-4o-mini-tts only.",
       default: "Read clearly and naturally, at a calm pace.",
     },
   });
 
-  async function requestSpeech(
+  const engineHost = bb.hosts.experimental_client({ contract: hostContract });
+
+  /** Settings return plain strings; narrow at the boundary, once. */
+  function parseSource(raw: string): Source {
+    return (SOURCES as readonly string[]).includes(raw)
+      ? (raw as Source)
+      : "local";
+  }
+
+  function parseRate(raw: string): number {
+    const value = Number.parseFloat(raw);
+    if (!Number.isFinite(value)) return 1;
+    return Math.min(2, Math.max(0.5, value));
+  }
+
+  /**
+   * Read on the machine the conversation is running on, so a thread on the
+   * laptop is not spoken by the desktop's engine. An explicit setting wins.
+   */
+  async function resolveHostId(threadId: string | null): Promise<string> {
+    const { machineId } = await settings.get();
+    if (machineId.trim().length > 0) return machineId.trim();
+    if (threadId !== null) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.environmentId !== null) {
+          const environment = await bb.sdk.environments.get({
+            environmentId: thread.environmentId,
+          });
+          if (environment.hostId) return environment.hostId;
+        }
+      } catch {
+        // Fall through to the primary host below.
+      }
+    }
+    const hosts = await bb.sdk.hosts.list();
+    const connected = hosts.find((host) => host.status === "connected");
+    if (!connected) throw new Error("No connected machine can speak this.");
+    return connected.id;
+  }
+
+  async function speakLocally(
     chunk: string,
-    key: string,
-    voice: string,
-    model: string,
-    instructions: string,
-  ): Promise<Uint8Array> {
+    threadId: string | null,
+    format: AudioFormat,
+  ) {
+    const { voice, rate, engineUrl } = await settings.get();
+    const hostId = await resolveHostId(threadId);
+    return engineHost.call(
+      "speak",
+      { engineUrl, text: chunk, voice, rate: parseRate(rate), format },
+      { hostId },
+    );
+  }
+
+  async function speakViaOpenai(chunk: string) {
+    const { openaiApiKey, openaiModel, openaiInstructions, voice, rate } =
+      await settings.get();
+    const key = openaiApiKey.trim();
+    if (key.length === 0) {
+      throw new Error(
+        "OpenAI is selected but no API key is set. Settings → Plugins → Read Aloud.",
+      );
+    }
     const body: Record<string, unknown> = {
-      model,
+      model: openaiModel,
       voice,
       input: chunk,
       response_format: "mp3",
+      speed: parseRate(rate),
     };
-    // Only gpt-4o-mini-tts accepts instructions; the tts-1 family 400s on it.
-    if (model === "gpt-4o-mini-tts" && instructions.trim().length > 0) {
-      body.instructions = instructions.trim();
+    // Only gpt-4o-mini-tts accepts instructions; the tts-1 family rejects them.
+    if (openaiModel === "gpt-4o-mini-tts" && openaiInstructions.trim()) {
+      body.instructions = openaiInstructions.trim();
+      delete body.speed;
     }
-    const response = await fetch(SPEECH_ENDPOINT, {
+    const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${key}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(120_000),
     });
     if (!response.ok) {
-      // Never surface the response body verbatim: it can echo request content.
-      const hint =
+      // Never echo the response body: it can repeat the request content.
+      bb.log.error(`OpenAI speech failed: HTTP ${response.status}`);
+      throw new Error(
         response.status === 401
-          ? "OpenAI rejected the key. Check Settings → Plugins → Read Aloud."
+          ? "OpenAI rejected the key. Settings → Plugins → Read Aloud."
           : response.status === 429
-            ? "OpenAI is rate limiting or the account has no credit."
-            : `OpenAI returned HTTP ${response.status}.`;
-      bb.log.error(`speech request failed: HTTP ${response.status}`);
-      throw new Error(hint);
+            ? "OpenAI is rate limiting, or the account has no credit."
+            : `OpenAI returned HTTP ${response.status}.`,
+      );
     }
-    return new Uint8Array(await response.arrayBuffer());
+    const audio = Buffer.from(await response.arrayBuffer());
+    return {
+      audioBase64: audio.toString("base64"),
+      mimeType: "audio/mpeg",
+      cached: false,
+    };
   }
 
   bb.rpc.register(rpcContract, {
-    async status() {
-      const { openaiApiKey, voice, model } = await settings.get();
-      return {
-        configured: openaiApiKey.trim().length > 0,
-        voice,
-        model,
-      };
+    async status({ threadId }) {
+      const stored = await settings.get();
+      const source = parseSource(stored.source);
+      const { voice, engineUrl, openaiApiKey } = stored;
+      if (source === "openai") {
+        const configured = openaiApiKey.trim().length > 0;
+        return {
+          source,
+          ready: configured,
+          voice,
+          voices: [],
+          message: configured
+            ? null
+            : "No OpenAI API key set. Settings → Plugins → Read Aloud.",
+        };
+      }
+      try {
+        const hostId = await resolveHostId(threadId);
+        const probe = await engineHost.call("probe", { engineUrl }, { hostId });
+        return {
+          source,
+          ready: probe.reachable && probe.voices.length > 0,
+          voice,
+          voices: probe.voices,
+          message: probe.reachable ? null : probe.message,
+        };
+      } catch (cause) {
+        return {
+          source,
+          ready: false,
+          voice,
+          voices: [],
+          message:
+            cause instanceof Error
+              ? `The machine with the speech engine is not reachable. ${cause.message}`
+              : String(cause),
+        };
+      }
     },
-    async speak({ text }) {
-      const { openaiApiKey, voice, model, instructions } = await settings.get();
-      const key = openaiApiKey.trim();
-      if (key.length === 0) {
-        throw new Error(
-          "No OpenAI API key set. Settings → Plugins → Read Aloud.",
-        );
-      }
-      const spoken = speakableText(text);
+
+    async prepare({ text }) {
+      const stored = await settings.get();
+      const source = parseSource(stored.source);
+      const { voice } = stored;
+      const spoken = normalizeForSpeech(speakableText(text));
       if (spoken.length === 0) {
-        throw new Error("Nothing to read: the message is only code or images.");
+        throw new Error("Nothing to read: this message is only code or images.");
       }
-      const chunks = splitForSpeech(spoken);
-      // MP3 frames concatenate cleanly, so several requests play as one take.
-      const parts: Uint8Array[] = [];
-      for (const chunk of chunks) {
-        parts.push(await requestSpeech(chunk, key, voice, model, instructions));
-      }
-      const total = parts.reduce((sum, part) => sum + part.length, 0);
-      const merged = new Uint8Array(total);
-      let offset = 0;
-      for (const part of parts) {
-        merged.set(part, offset);
-        offset += part.length;
-      }
-      return {
-        audioBase64: Buffer.from(merged).toString("base64"),
-        mimeType: "audio/mpeg",
-        spokenChars: spoken.length,
-      };
+      const limit = source === "openai" ? OPENAI_MAX_CHARS : MAX_CHUNK_CHARS;
+      return { chunks: splitForSpeech(spoken, limit), source, voice };
+    },
+
+    async speakChunk({ chunk, threadId, format }) {
+      const source = parseSource((await settings.get()).source);
+      return source === "openai"
+        ? speakViaOpenai(chunk)
+        : speakLocally(chunk, threadId, format);
     },
   });
 }
