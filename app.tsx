@@ -255,6 +255,20 @@ export default definePluginApp((app) => {
       // jobs, which is what the Claude app does and what the owner asked for.
       const style = document.createElement("style");
       style.textContent = `
+        /*
+         * BB reveals a message's actions on hover, and on narrow touch screens
+         * moves plugin actions into an overflow menu instead. A tablet is
+         * neither: too wide for the mobile rule, and with no pointer to hover,
+         * so the button exists and is never visible. Show it on any touch
+         * screen, which also puts it in the row on a phone rather than two
+         * taps deep.
+         */
+        @media (pointer: coarse) {
+          button[aria-label="${ACTION_TITLE}"] {
+            display: inline-flex !important;
+            opacity: 1 !important;
+          }
+        }
         button[${PLAYING_ATTRIBUTE}] > * { visibility: hidden; }
         button[${PLAYING_ATTRIBUTE}] {
           position: relative;
