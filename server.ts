@@ -159,6 +159,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   const engineHost = bb.hosts.experimental_client({ contract: hostContract });
 
+  /**
+   * Which machine a thread reads on rarely changes, and asking costs two or
+   * three round trips inside the server — measurably more than the synthesis
+   * itself. Remember the answer briefly.
+   */
+  const hostByThread = new Map<string, { hostId: string; at: number }>();
+  const HOST_CACHE_MS = 5 * 60_000;
+
   /** Settings return plain strings; narrow at the boundary, once. */
   function parseSource(raw: string): Source {
     return (SOURCES as readonly string[]).includes(raw)
@@ -179,6 +187,17 @@ export default async function plugin(bb: BbPluginApi) {
   async function resolveHostId(threadId: string | null): Promise<string> {
     const { machineId } = await settings.get();
     if (machineId.trim().length > 0) return machineId.trim();
+    const key = threadId ?? "";
+    const remembered = hostByThread.get(key);
+    if (remembered && Date.now() - remembered.at < HOST_CACHE_MS) {
+      return remembered.hostId;
+    }
+    const found = await lookUpHostId(threadId);
+    hostByThread.set(key, { hostId: found, at: Date.now() });
+    return found;
+  }
+
+  async function lookUpHostId(threadId: string | null): Promise<string> {
     if (threadId !== null) {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
