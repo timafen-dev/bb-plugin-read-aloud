@@ -37,6 +37,15 @@ export function normalizeForSpeech(text: string): string {
     .replace(/(?:^|\s)(?:[\w.-]*\/)+([\w.-]+\.\w{1,6})\b/gu, " файл $1")
     .replace(/\b[0-9a-f]{7,40}\b/gu, "версия")
     .replace(/([!?.,:;—-])\1{1,}/gu, "$1")
+    // A message that already said "файл src/main.py" would otherwise be read
+    // as "файл файл main.py": the substitution repeats a word the author wrote.
+    // Only the words this function inserts are collapsed — a genuine "очень
+    // очень" in someone's prose is theirs to keep. JavaScript's \b is
+    // ASCII-only, so the boundaries are spelled out instead.
+    .replace(
+      /(^|[^\p{L}])(ссылка|файл|версия)(?:\s+\2)+(?![\p{L}])/giu,
+      "$1$2",
+    )
     .replace(/[ \t]{2,}/gu, " ")
     .trim();
 }

@@ -79,3 +79,18 @@ test("nothing is lost when a message is split", () => {
   const joined = splitForSpeech(source, 25).join(" ").replace(/\s+/gu, " ");
   assert.equal(joined, source.replace(/\s+/gu, " "));
 });
+
+test("does not repeat a word the author already wrote", () => {
+  const spoken = normalizeForSpeech(
+    "Смотри файл src/main.py, версия 036873d5, и ссылка https://example.com/x",
+  );
+  assert.ok(!/файл\s+файл/iu.test(spoken), spoken);
+  assert.ok(!/версия\s+версия/iu.test(spoken), spoken);
+  assert.ok(!/ссылка\s+ссылка/iu.test(spoken), spoken);
+  assert.ok(spoken.includes("файл main.py"));
+});
+
+test("a genuine repetition in ordinary prose is left alone", () => {
+  assert.equal(normalizeForSpeech("Очень очень важно"), "Очень очень важно");
+  assert.equal(normalizeForSpeech("Так так так"), "Так так так");
+});
