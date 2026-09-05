@@ -109,3 +109,20 @@ test("the manifest version matches the release tag it is published under", async
   assert.equal(manifest.bb.server, "./server.ts");
   assert.equal(manifest.bb.app, "./app.tsx");
 });
+
+test("the manifest icon is a name BB actually has", async () => {
+  const manifest = JSON.parse(
+    await (await import("node:fs/promises")).readFile(
+      new URL("../package.json", import.meta.url),
+      "utf8",
+    ),
+  ) as { bb: { branding: { icon: string } } };
+  // BB draws plugin actions with the plugin's manifest icon before the
+  // action's own hint, and silently falls back to a lightning bolt for a name
+  // it does not know. "Volume2" was such a name, and that is what shipped.
+  const KNOWN = ["Play", "Pause", "Square", "Mic", "Zap"];
+  assert.ok(
+    KNOWN.includes(manifest.bb.branding.icon),
+    `unknown icon: ${manifest.bb.branding.icon}`,
+  );
+});
