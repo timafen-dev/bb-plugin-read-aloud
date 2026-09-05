@@ -94,3 +94,18 @@ test("a genuine repetition in ordinary prose is left alone", () => {
   assert.equal(normalizeForSpeech("Очень очень важно"), "Очень очень важно");
   assert.equal(normalizeForSpeech("Так так так"), "Так так так");
 });
+
+test("the manifest version matches the release tag it is published under", async () => {
+  const manifest = JSON.parse(
+    await (await import("node:fs/promises")).readFile(
+      new URL("../package.json", import.meta.url),
+      "utf8",
+    ),
+  ) as { version: string; bb: { host: string; server: string; app: string } };
+  // v0.2.1 shipped a package.json still saying 0.2.0: the tag moved, the
+  // manifest did not, and `bb plugin outdated` had no way to tell.
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/u);
+  assert.equal(manifest.bb.host, "./host.ts");
+  assert.equal(manifest.bb.server, "./server.ts");
+  assert.equal(manifest.bb.app, "./app.tsx");
+});
