@@ -15,6 +15,7 @@ import { useEffect, useState } from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server.ts";
+import { type PausedAt, resumePoint } from "./text.ts";
 
 const PLUGIN_ID = "read-aloud";
 const RPC_URL = `/api/v1/plugins/${PLUGIN_ID}/rpc`;
@@ -78,17 +79,43 @@ function markPlaying(playing: boolean): void {
   else pressedButton.removeAttribute(PLAYING_ATTRIBUTE);
 }
 
+/**
+ * Where a reading was interrupted, so pressing ▶ again continues instead of
+ * starting over. A long answer stopped for a voice message is the case this
+ * exists for; the decision itself lives in text.ts, where it is tested.
+ */
+let paused: PausedAt | null = null;
+
 /** One reading at a time across the whole app. */
 class Reading {
   private audio: HTMLAudioElement | null = null;
   private urls: string[] = [];
   private cancelled = false;
   private button: HTMLElement | null = pressedButton;
+  private chunks: string[] = [];
+  private index = 0;
+  private threadId = "";
+  private format: AudioFormat = "mp3";
 
   constructor(readonly messageId: string) {}
 
-  cancel(): void {
+  /**
+   * `remember` separates the two ways a reading ends. Interrupted — by the
+   * button or by the microphone — keeps the place. Finished, or failed, has no
+   * place worth keeping.
+   */
+  cancel(remember = false): void {
     this.cancelled = true;
+    if (remember && this.audio !== null && this.chunks.length > 0) {
+      paused = {
+        messageId: this.messageId,
+        chunks: this.chunks,
+        index: this.index,
+        offset: this.audio.currentTime,
+        threadId: this.threadId,
+        format: this.format,
+      };
+    }
     if (this.audio !== null) {
       this.audio.pause();
       this.audio.src = "";
@@ -103,10 +130,20 @@ class Reading {
     return this.cancelled;
   }
 
-  private playOne(url: string): Promise<void> {
+  private playOne(url: string, startAt = 0): Promise<void> {
     return new Promise((resolve, reject) => {
       const audio = new Audio(url);
       this.audio = audio;
+      if (startAt > 0) {
+        // currentTime only sticks once the browser knows the duration.
+        audio.addEventListener(
+          "loadedmetadata",
+          () => {
+            audio.currentTime = Math.min(startAt, audio.duration || startAt);
+          },
+          { once: true },
+        );
+      }
       audio.addEventListener("ended", () => resolve(), { once: true });
       audio.addEventListener(
         "error",
@@ -125,28 +162,38 @@ class Reading {
     chunks: string[],
     threadId: string,
     format: AudioFormat,
+    from = 0,
+    offset = 0,
   ): Promise<void> {
+    this.chunks = chunks;
+    this.threadId = threadId;
+    this.format = format;
     const fetchChunk = (chunk: string) =>
       rpc<ChunkAudio>("speakChunk", { chunk, threadId, format });
 
-    let pending = fetchChunk(chunks[0]!);
-    for (let index = 0; index < chunks.length; index += 1) {
+    // Resuming re-requests the piece it left off in; the engine caches by the
+    // text, so that costs a millisecond rather than a fresh synthesis.
+    let pending = fetchChunk(chunks[from]!);
+    for (let index = from; index < chunks.length; index += 1) {
+      this.index = index;
       const audio = await pending;
       if (this.cancelled) return;
       const next = chunks[index + 1];
       pending = next === undefined ? pending : fetchChunk(next);
       const url = toBlobUrl(audio);
       this.urls.push(url);
-      await this.playOne(url);
+      await this.playOne(url, index === from ? offset : 0);
       if (this.cancelled) return;
     }
+    // Reaching the end means there is nothing left to resume.
+    if (paused?.messageId === this.messageId) paused = null;
   }
 }
 
 let active: Reading | null = null;
 
-function stopReading(): void {
-  active?.cancel();
+function stopReading(remember = true): void {
+  active?.cancel(remember);
   active = null;
   markPlaying(false);
 }
@@ -204,8 +251,8 @@ export default definePluginApp((app) => {
     async run({ threadId, message, selectedText }) {
       const wasReading = active;
       stopReading();
-      // Second press on the message already speaking = stop. A press on a
-      // different message replaces the reading rather than talking over it.
+      // Pressing the message that is speaking stops it — and the place is
+      // kept, so the next press continues from there.
       if (
         wasReading !== null &&
         wasReading.messageId === message.id &&
@@ -214,28 +261,43 @@ export default definePluginApp((app) => {
         return;
       }
 
-      const text = (selectedText ?? "").trim() || message.text;
+      const selection = (selectedText ?? "").trim();
+      const text = selection || message.text;
       if (text.trim().length === 0) return;
 
       const reading = new Reading(message.id);
       active = reading;
       markPlaying(true);
+      let finished = false;
       try {
-        const { chunks } = await rpc<{ chunks: string[] }>("prepare", {
-          text,
-          threadId,
-        });
+        const format = preferredFormat();
+        const resume = resumePoint(paused, message.id, selection, format);
+        const chunks =
+          resume?.chunks ??
+          (await rpc<{ chunks: string[] }>("prepare", { text, threadId }))
+            .chunks;
         if (reading.stopped) return;
         if (chunks.length === 0) throw new Error("Nothing to read.");
-        await reading.run(chunks, threadId, preferredFormat());
+        paused = null;
+        await reading.run(
+          chunks,
+          threadId,
+          format,
+          resume?.index ?? 0,
+          resume?.offset ?? 0,
+        );
+        finished = true;
       } catch (cause) {
         // Errors are the one thing worth interrupting for; progress is not.
         toast.error(cause instanceof Error ? cause.message : String(cause));
       } finally {
         if (active === reading) {
-          reading.cancel();
+          // Only a real interruption is worth resuming from; finishing and
+          // failing both leave nothing behind.
+          reading.cancel(false);
           active = null;
         }
+        if (!finished) markPlaying(false);
       }
     },
   });

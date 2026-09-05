@@ -75,3 +75,40 @@ export function splitForSpeech(text: string, limit: number): string[] {
   if (tail.length > 0) chunks.push(tail);
   return chunks.filter((chunk) => chunk.length > 0);
 }
+
+/** Where an interrupted reading left off. */
+export interface PausedAt {
+  messageId: string;
+  chunks: string[];
+  index: number;
+  /** Seconds into `chunks[index]`. */
+  offset: number;
+  threadId: string;
+  format: string;
+}
+
+/**
+ * Decide whether pressing ▶ continues an interrupted reading or starts over.
+ *
+ * Continuing is only right when it is the same message, read the same way. A
+ * highlighted selection is a different thing to read, and a different audio
+ * format means the remembered offset belongs to audio we are not about to
+ * play, so both start from the beginning.
+ */
+export function resumePoint(
+  paused: PausedAt | null,
+  messageId: string,
+  selection: string,
+  format: string,
+): { index: number; offset: number; chunks: string[] } | null {
+  if (paused === null) return null;
+  if (paused.messageId !== messageId) return null;
+  if (selection.trim().length > 0) return null;
+  if (paused.format !== format) return null;
+  if (paused.index < 0 || paused.index >= paused.chunks.length) return null;
+  return {
+    index: paused.index,
+    offset: Math.max(0, paused.offset),
+    chunks: paused.chunks,
+  };
+}

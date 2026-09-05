@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   normalizeForSpeech,
+  type PausedAt,
+  resumePoint,
   speakableText,
   splitForSpeech,
 } from "../text.ts";
@@ -125,4 +127,45 @@ test("the manifest icon is a name BB actually has", async () => {
     KNOWN.includes(manifest.bb.branding.icon),
     `unknown icon: ${manifest.bb.branding.icon}`,
   );
+});
+
+const pausedAt = (over: Partial<PausedAt> = {}): PausedAt => ({
+  messageId: "msg-1",
+  chunks: ["первый кусок", "второй кусок"],
+  index: 1,
+  offset: 4.25,
+  threadId: "thr-1",
+  format: "mp3",
+  ...over,
+});
+
+test("continues the same message from where it stopped", () => {
+  const point = resumePoint(pausedAt(), "msg-1", "", "mp3");
+  assert.equal(point?.index, 1);
+  assert.equal(point?.offset, 4.25);
+});
+
+test("starts over on a different message", () => {
+  assert.equal(resumePoint(pausedAt(), "msg-2", "", "mp3"), null);
+});
+
+test("a highlighted selection is a different thing to read, so it starts over", () => {
+  assert.equal(resumePoint(pausedAt(), "msg-1", "  кусок текста  ", "mp3"), null);
+});
+
+test("a remembered offset is not reused for a different audio format", () => {
+  assert.equal(resumePoint(pausedAt(), "msg-1", "", "opus"), null);
+});
+
+test("nothing remembered means nothing to continue", () => {
+  assert.equal(resumePoint(null, "msg-1", "", "mp3"), null);
+});
+
+test("a stale index outside the pieces starts over instead of throwing", () => {
+  assert.equal(resumePoint(pausedAt({ index: 9 }), "msg-1", "", "mp3"), null);
+  assert.equal(resumePoint(pausedAt({ index: -1 }), "msg-1", "", "mp3"), null);
+});
+
+test("a negative offset is clamped rather than seeking backwards", () => {
+  assert.equal(resumePoint(pausedAt({ offset: -3 }), "msg-1", "", "mp3")?.offset, 0);
 });
