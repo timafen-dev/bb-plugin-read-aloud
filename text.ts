@@ -51,14 +51,36 @@ export function normalizeForSpeech(text: string): string {
 }
 
 /**
+ * How long each piece may be, in order. The last entry repeats.
+ *
+ * Synthesis costs time in proportion to the text, while the audio it produces
+ * plays for ten times longer — so a short first piece starts the voice almost
+ * at once and the queue is never caught up with afterwards. Measured on an
+ * ordinary loaded machine: 180 characters take about half a second and play
+ * for eight, 1500 take five seconds and play for eighty.
+ */
+export const CHUNK_SIZE_RAMP = [180, 420, 900, 1500] as const;
+
+function limitFor(sizes: readonly number[], index: number): number {
+  return sizes[Math.min(index, sizes.length - 1)]!;
+}
+
+/**
  * Split into pieces the route accepts, preferring paragraph then sentence
  * boundaries so a seam lands where a reader would pause anyway.
  */
-export function splitForSpeech(text: string, limit: number): string[] {
-  if (text.length <= limit) return text.length > 0 ? [text] : [];
+export function splitForSpeech(
+  text: string,
+  sizes: readonly number[],
+): string[] {
   const chunks: string[] = [];
-  let rest = text;
-  while (rest.length > limit) {
+  let rest = text.trim();
+  while (rest.length > 0) {
+    const limit = limitFor(sizes, chunks.length);
+    if (rest.length <= limit) {
+      chunks.push(rest);
+      break;
+    }
     const window = rest.slice(0, limit);
     const seam = Math.max(
       window.lastIndexOf("\n\n"),
@@ -68,13 +90,13 @@ export function splitForSpeech(text: string, limit: number): string[] {
       window.lastIndexOf("\n"),
     );
     const cut = seam > limit * 0.5 ? seam + 1 : limit;
-    chunks.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut);
+    const piece = rest.slice(0, cut).trim();
+    if (piece.length > 0) chunks.push(piece);
+    rest = rest.slice(cut).trim();
   }
-  const tail = rest.trim();
-  if (tail.length > 0) chunks.push(tail);
-  return chunks.filter((chunk) => chunk.length > 0);
+  return chunks;
 }
+
 
 /** Where an interrupted reading left off. */
 export interface PausedAt {

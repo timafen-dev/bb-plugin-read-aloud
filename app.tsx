@@ -164,6 +164,7 @@ class Reading {
     format: AudioFormat,
     from = 0,
     offset = 0,
+    firstAudio: ChunkAudio | null = null,
   ): Promise<void> {
     this.chunks = chunks;
     this.threadId = threadId;
@@ -171,9 +172,11 @@ class Reading {
     const fetchChunk = (chunk: string) =>
       rpc<ChunkAudio>("speakChunk", { chunk, threadId, format });
 
+    // The opening piece usually arrives with the split, already synthesized.
     // Resuming re-requests the piece it left off in; the engine caches by the
     // text, so that costs a millisecond rather than a fresh synthesis.
-    let pending = fetchChunk(chunks[from]!);
+    let pending =
+      firstAudio !== null ? Promise.resolve(firstAudio) : fetchChunk(chunks[from]!);
     for (let index = from; index < chunks.length; index += 1) {
       this.index = index;
       const audio = await pending;
@@ -272,10 +275,19 @@ export default definePluginApp((app) => {
       try {
         const format = preferredFormat();
         const resume = resumePoint(paused, message.id, selection, format);
-        const chunks =
-          resume?.chunks ??
-          (await rpc<{ chunks: string[] }>("prepare", { text, threadId }))
-            .chunks;
+        // Starting fresh asks for the audio of the first piece in the same
+        // call as the split; resuming does not, because the piece it needs is
+        // somewhere in the middle.
+        let chunks = resume?.chunks;
+        let firstAudio: ChunkAudio | null = null;
+        if (chunks === undefined) {
+          const prepared = await rpc<{
+            chunks: string[];
+            first: ChunkAudio | null;
+          }>("prepare", { text, threadId, format });
+          chunks = prepared.chunks;
+          firstAudio = prepared.first;
+        }
         if (reading.stopped) return;
         if (chunks.length === 0) throw new Error("Nothing to read.");
         paused = null;
@@ -285,6 +297,7 @@ export default definePluginApp((app) => {
           format,
           resume?.index ?? 0,
           resume?.offset ?? 0,
+          firstAudio,
         );
         finished = true;
       } catch (cause) {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  CHUNK_SIZE_RAMP,
   normalizeForSpeech,
   type PausedAt,
   resumePoint,
@@ -57,12 +58,12 @@ test("normalization keeps ordinary Russian text untouched", () => {
 });
 
 test("a short message stays one piece", () => {
-  assert.deepEqual(splitForSpeech("Короткая фраза.", 1500), ["Короткая фраза."]);
+  assert.deepEqual(splitForSpeech("Короткая фраза.", [1500]), ["Короткая фраза."]);
 });
 
 test("splitting prefers sentence ends over cutting mid-word", () => {
   const sentence = "Это предложение ровно на сорок девять знаков. ";
-  const chunks = splitForSpeech(sentence.repeat(40), 200);
+  const chunks = splitForSpeech(sentence.repeat(40), [200]);
   assert.ok(chunks.length > 1);
   for (const chunk of chunks) {
     assert.ok(chunk.length <= 200, `piece too long: ${chunk.length}`);
@@ -71,14 +72,14 @@ test("splitting prefers sentence ends over cutting mid-word", () => {
 });
 
 test("splitting a single unbroken run still respects the limit", () => {
-  const chunks = splitForSpeech("я".repeat(500), 100);
+  const chunks = splitForSpeech("я".repeat(500), [100]);
   assert.equal(chunks.length, 5);
   for (const chunk of chunks) assert.ok(chunk.length <= 100);
 });
 
 test("nothing is lost when a message is split", () => {
   const source = "Первое предложение. Второе предложение! Третье? Четвёртое.";
-  const joined = splitForSpeech(source, 25).join(" ").replace(/\s+/gu, " ");
+  const joined = splitForSpeech(source, [25]).join(" ").replace(/\s+/gu, " ");
   assert.equal(joined, source.replace(/\s+/gu, " "));
 });
 
@@ -168,4 +169,25 @@ test("a stale index outside the pieces starts over instead of throwing", () => {
 
 test("a negative offset is clamped rather than seeking backwards", () => {
   assert.equal(resumePoint(pausedAt({ offset: -3 }), "msg-1", "", "mp3")?.offset, 0);
+});
+
+test("the first piece is short so the voice starts almost at once", () => {
+  const sentence = "Это предложение занимает ровно сорок пять знаков. ";
+  const chunks = splitForSpeech(sentence.repeat(60), CHUNK_SIZE_RAMP);
+  assert.ok(chunks.length >= 4);
+  assert.ok(
+    chunks[0]!.length <= CHUNK_SIZE_RAMP[0]!,
+    `first piece is ${chunks[0]!.length} characters`,
+  );
+  // Later pieces are allowed to grow: by then the voice is already speaking.
+  assert.ok(chunks[3]!.length > CHUNK_SIZE_RAMP[0]!);
+});
+
+test("the ramp never lets a piece exceed what one host call can carry", () => {
+  const chunks = splitForSpeech("Слово. ".repeat(2000), CHUNK_SIZE_RAMP);
+  for (const chunk of chunks) assert.ok(chunk.length <= 1500);
+});
+
+test("a short message is still one piece under the ramp", () => {
+  assert.deepEqual(splitForSpeech("Коротко.", CHUNK_SIZE_RAMP), ["Коротко."]);
 });

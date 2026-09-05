@@ -19,6 +19,7 @@ import {
   type AudioFormat,
 } from "./contract.js";
 import {
+  CHUNK_SIZE_RAMP,
   normalizeForSpeech,
   speakableText,
   splitForSpeech,
@@ -42,6 +43,8 @@ export const rpcContract = defineRpcContract({
       .object({
         text: z.string().min(1).max(MAX_TOTAL_CHARS),
         threadId: z.string().nullable(),
+        /** Omit to receive the split alone, without waiting for audio. */
+        format: z.enum(AUDIO_FORMATS).optional(),
       })
       .strict(),
     output: z
@@ -49,6 +52,14 @@ export const rpcContract = defineRpcContract({
         chunks: z.array(z.string()),
         source: z.enum(SOURCES),
         voice: z.string(),
+        /** Audio for the first piece, so speaking starts after one round trip. */
+        first: z
+          .object({
+            audioBase64: z.string(),
+            mimeType: z.string(),
+            cached: z.boolean(),
+          })
+          .nullable(),
       })
       .strict(),
   },
@@ -291,7 +302,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     },
 
-    async prepare({ text }) {
+    async prepare({ text, threadId, format }) {
       const stored = await settings.get();
       const source = parseSource(stored.source);
       const { voice } = stored;
@@ -299,8 +310,21 @@ export default async function plugin(bb: BbPluginApi) {
       if (spoken.length === 0) {
         throw new Error("Nothing to read: this message is only code or images.");
       }
-      const limit = source === "openai" ? OPENAI_MAX_CHARS : MAX_CHUNK_CHARS;
-      return { chunks: splitForSpeech(spoken, limit), source, voice };
+      // OpenAI charges per request and has no per-call latency worth shaving,
+      // so it keeps one large size; the local engine ramps up from a short
+      // first piece.
+      const sizes =
+        source === "openai" ? [OPENAI_MAX_CHARS] : CHUNK_SIZE_RAMP;
+      const chunks = splitForSpeech(spoken, sizes);
+      // Returning the first piece's audio here saves a whole round trip
+      // before the voice starts, which is most of the wait on a short piece.
+      const first =
+        format === undefined || chunks.length === 0
+          ? null
+          : source === "openai"
+            ? await speakViaOpenai(chunks[0]!)
+            : await speakLocally(chunks[0]!, threadId, format);
+      return { chunks, source, voice, first };
     },
 
     async speakChunk({ chunk, threadId, format }) {
