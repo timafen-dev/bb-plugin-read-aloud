@@ -334,6 +334,10 @@ export default definePluginApp((app) => {
             border-radius: 14px !important;
             touch-action: manipulation;
             -webkit-tap-highlight-color: transparent;
+          }
+          /* Voice input has inverted native colors. Preserve its background
+           * so its icon stays visible in both light and dark themes. */
+          button[aria-label="${ACTION_TITLE}"] {
             background: color-mix(in srgb, currentColor 7%, transparent);
           }
           button[aria-label="${ACTION_TITLE}"] svg,
@@ -344,8 +348,7 @@ export default definePluginApp((app) => {
             width: 22px !important;
             height: 22px !important;
           }
-          button[aria-label="${ACTION_TITLE}"]:active,
-          button[aria-label="Start voice input"]:active {
+          button[aria-label="${ACTION_TITLE}"]:active {
             background: color-mix(in srgb, currentColor 14%, transparent);
           }
         }
