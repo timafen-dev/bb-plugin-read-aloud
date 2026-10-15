@@ -17,9 +17,10 @@ import {
   hostContract,
   MAX_CHUNK_CHARS,
   type AudioFormat,
-} from "./contract.js";
+} from "./contract.ts";
 import {
   CHUNK_SIZE_RAMP,
+  OPENAI_CHUNK_SIZE_RAMP,
   normalizeForSpeech,
   speakableText,
   splitForSpeech,
@@ -30,8 +31,8 @@ const OPENAI_SPEECH_ENDPOINT = "https://api.openai.com/v1/audio/speech";
 /** Refuse absurd inputs rather than spending minutes of audio on them. */
 const MAX_TOTAL_CHARS = 40_000;
 
-/** OpenAI accepts far more per request than one host RPC call can carry. */
-const OPENAI_MAX_CHARS = 4_000;
+/** Fail with a JSON error before the public gateway's 30-second timeout. */
+const OPENAI_TIMEOUT_MS = 25_000;
 
 export const SOURCES = ["local", "openai"] as const;
 export type Source = (typeof SOURCES)[number];
@@ -251,32 +252,41 @@ export default async function plugin(bb: BbPluginApi) {
     if (openaiModel === "gpt-4o-mini-tts" && openaiInstructions.trim()) {
       body.instructions = openaiInstructions.trim();
     }
-    const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
-    });
-    if (!response.ok) {
-      // Never echo the response body: it can repeat the request content.
-      bb.log.error(`OpenAI speech failed: HTTP ${response.status}`);
-      throw new Error(
-        response.status === 401
-          ? "OpenAI rejected the key. Settings → Plugins → Read Aloud."
-          : response.status === 429
-            ? "OpenAI is rate limiting, or the account has no credit."
-            : `OpenAI returned HTTP ${response.status}.`,
-      );
+    const signal = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
+    try {
+      const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+      if (!response.ok) {
+        // Never echo the response body: it can repeat the request content.
+        bb.log.error(`OpenAI speech failed: HTTP ${response.status}`);
+        throw new Error(
+          response.status === 401
+            ? "OpenAI rejected the key. Settings → Plugins → Read Aloud."
+            : response.status === 429
+              ? "OpenAI is rate limiting, or the account has no credit."
+              : `OpenAI returned HTTP ${response.status}.`,
+        );
+      }
+      const audio = Buffer.from(await response.arrayBuffer());
+      return {
+        audioBase64: audio.toString("base64"),
+        mimeType: "audio/mpeg",
+        cached: false,
+      };
+    } catch (cause) {
+      if (signal.aborted) {
+        bb.log.warn("OpenAI speech exceeded the request time budget");
+        throw new Error("Сервис озвучки не ответил вовремя. Попробуй ещё раз.");
+      }
+      throw cause;
     }
-    const audio = Buffer.from(await response.arrayBuffer());
-    return {
-      audioBase64: audio.toString("base64"),
-      mimeType: "audio/mpeg",
-      cached: false,
-    };
   }
 
   bb.rpc.register(rpcContract, {
@@ -328,11 +338,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (spoken.length === 0) {
         throw new Error("Nothing to read: this message is only code or images.");
       }
-      // OpenAI charges per request and has no per-call latency worth shaving,
-      // so it keeps one large size; the local engine ramps up from a short
-      // first piece.
+      // Both routes start with a short piece. OpenAI buffers the whole audio
+      // response here, so a large piece can outlast the gateway's timeout.
       const sizes =
-        source === "openai" ? [OPENAI_MAX_CHARS] : CHUNK_SIZE_RAMP;
+        source === "openai" ? OPENAI_CHUNK_SIZE_RAMP : CHUNK_SIZE_RAMP;
       const chunks = splitForSpeech(spoken, sizes);
       // Returning the first piece's audio here saves a whole round trip
       // before the voice starts, which is most of the wait on a short piece.

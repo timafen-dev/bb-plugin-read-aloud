@@ -96,4 +96,9 @@ permission while synthesis is pending. Stop, microphone interruption, and
 resume still keep the position in the current chunk. Disabling or reloading the
 plugin closes its audio context and removes its styles and listeners.
 
+OpenAI readings start with a short phrase and continue in pieces of at most
+800 characters. Each synthesis request has a 25-second deadline, below the
+gateway's 30-second limit, so long messages do not wait for one large audio
+file before playback starts.
+
 Browser behavior follows the [Web Audio activation guidance](https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API/Best_practices#autoplay_policy).

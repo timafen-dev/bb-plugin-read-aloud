@@ -61,6 +61,9 @@ export function normalizeForSpeech(text: string): string {
  */
 export const CHUNK_SIZE_RAMP = [180, 420, 900, 1500] as const;
 
+/** Keep each non-streaming speech response inside the gateway's 30 s budget. */
+export const OPENAI_CHUNK_SIZE_RAMP = [180, 420, 800] as const;
+
 function limitFor(sizes: readonly number[], index: number): number {
   return sizes[Math.min(index, sizes.length - 1)]!;
 }
