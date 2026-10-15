@@ -250,7 +250,6 @@ export default async function plugin(bb: BbPluginApi) {
     // Only gpt-4o-mini-tts accepts instructions; the tts-1 family rejects them.
     if (openaiModel === "gpt-4o-mini-tts" && openaiInstructions.trim()) {
       body.instructions = openaiInstructions.trim();
-      delete body.speed;
     }
     const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
       method: "POST",
