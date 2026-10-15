@@ -16,6 +16,7 @@ import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server.ts";
 import { type PausedAt, resumePoint } from "./text.ts";
+import { activatePlayback, ChunkPlayback, disposePlayback } from "./playback.ts";
 
 const PLUGIN_ID = "read-aloud";
 const RPC_URL = `/api/v1/plugins/${PLUGIN_ID}/rpc`;
@@ -61,13 +62,8 @@ async function rpc<T>(method: string, input: unknown): Promise<T> {
   return ("result" in asRecord ? asRecord.result : payload) as T;
 }
 
-function toBlobUrl({ audioBase64, mimeType }: ChunkAudio): string {
-  const binary = atob(audioBase64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+function audioBytes({ audioBase64 }: ChunkAudio): Uint8Array {
+  return Uint8Array.from(atob(audioBase64), (char) => char.charCodeAt(0));
 }
 
 /** The button the user actually pressed, so the ■ lands on the right message. */
@@ -88,8 +84,7 @@ let paused: PausedAt | null = null;
 
 /** One reading at a time across the whole app. */
 class Reading {
-  private audio: HTMLAudioElement | null = null;
-  private urls: string[] = [];
+  private audio: ChunkPlayback | null = null;
   private cancelled = false;
   private button: HTMLElement | null = pressedButton;
   private chunks: string[] = [];
@@ -117,12 +112,9 @@ class Reading {
       };
     }
     if (this.audio !== null) {
-      this.audio.pause();
-      this.audio.src = "";
+      this.audio.stop();
       this.audio = null;
     }
-    for (const url of this.urls) URL.revokeObjectURL(url);
-    this.urls = [];
     this.button?.removeAttribute(PLAYING_ATTRIBUTE);
   }
 
@@ -130,28 +122,10 @@ class Reading {
     return this.cancelled;
   }
 
-  private playOne(url: string, startAt = 0): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const audio = new Audio(url);
-      this.audio = audio;
-      if (startAt > 0) {
-        // currentTime only sticks once the browser knows the duration.
-        audio.addEventListener(
-          "loadedmetadata",
-          () => {
-            audio.currentTime = Math.min(startAt, audio.duration || startAt);
-          },
-          { once: true },
-        );
-      }
-      audio.addEventListener("ended", () => resolve(), { once: true });
-      audio.addEventListener(
-        "error",
-        () => reject(new Error("The browser could not play the audio.")),
-        { once: true },
-      );
-      audio.play().catch(reject);
-    });
+  private playOne(audio: ChunkAudio, startAt = 0): Promise<void> {
+    const playback = new ChunkPlayback();
+    this.audio = playback;
+    return playback.play(audioBytes(audio), startAt);
   }
 
   /**
@@ -183,9 +157,9 @@ class Reading {
       if (this.cancelled) return;
       const next = chunks[index + 1];
       pending = next === undefined ? pending : fetchChunk(next);
-      const url = toBlobUrl(audio);
-      this.urls.push(url);
-      await this.playOne(url, index === from ? offset : 0);
+      // Prefetch can fail while the current piece is still speaking.
+      void pending.catch(() => {});
+      await this.playOne(audio, index === from ? offset : 0);
       if (this.cancelled) return;
     }
     // Reaching the end means there is nothing left to resume.
@@ -268,11 +242,13 @@ export default definePluginApp((app) => {
       const text = selection || message.text;
       if (text.trim().length === 0) return;
 
+      // Also covers the selection menu, which has no message Play button.
       const reading = new Reading(message.id);
       active = reading;
       markPlaying(true);
       let finished = false;
       try {
+        activatePlayback();
         const format = preferredFormat();
         const resume = resumePoint(paused, message.id, selection, format);
         // Starting fresh asks for the audio of the first piece in the same
@@ -338,10 +314,39 @@ export default definePluginApp((app) => {
          * screen, which also puts it in the row on a phone rather than two
          * taps deep.
          */
-        @media (pointer: coarse) {
+        @media (pointer: coarse), (any-pointer: coarse) {
           button[aria-label="${ACTION_TITLE}"] {
             display: inline-flex !important;
             opacity: 1 !important;
+          }
+          /* Bigger finger targets, while keeping the rest of the toolbar compact. */
+          button[aria-label="${ACTION_TITLE}"],
+          button[aria-label="Start voice input"],
+          button[aria-label="Stop voice input"],
+          button[aria-label="Stop recording"],
+          button[aria-label="Cancel voice input"] {
+            box-sizing: border-box;
+            min-width: 48px !important;
+            min-height: 48px !important;
+            width: 48px !important;
+            height: 48px !important;
+            flex-shrink: 0;
+            border-radius: 14px !important;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            background: color-mix(in srgb, currentColor 7%, transparent);
+          }
+          button[aria-label="${ACTION_TITLE}"] svg,
+          button[aria-label="Start voice input"] svg,
+          button[aria-label="Stop voice input"] svg,
+          button[aria-label="Stop recording"] svg,
+          button[aria-label="Cancel voice input"] svg {
+            width: 22px !important;
+            height: 22px !important;
+          }
+          button[aria-label="${ACTION_TITLE}"]:active,
+          button[aria-label="Start voice input"]:active {
+            background: color-mix(in srgb, currentColor 14%, transparent);
           }
         }
         button[${PLAYING_ATTRIBUTE}] > * { visibility: hidden; }
@@ -369,7 +374,11 @@ export default definePluginApp((app) => {
       // user pressed is known before the reading starts.
       const onClick = (event: Event) => {
         const button = (event.target as Element | null)?.closest?.("button");
-        if (button && isReadAloudButton(button)) pressedButton = button;
+        if (button && isReadAloudButton(button)) {
+          pressedButton = button;
+          // Capture runs inside the trusted user gesture, before any SDK/RPC wait.
+          try { activatePlayback(); } catch { /* run reports a playback error */ }
+        }
       };
       document.addEventListener("click", onClick, true);
 
@@ -392,6 +401,7 @@ export default definePluginApp((app) => {
         }
         style.remove();
         stopReading();
+        disposePlayback();
       };
     },
   });

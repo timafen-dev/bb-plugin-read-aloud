@@ -84,3 +84,16 @@ selected, the message text is sent to OpenAI to be spoken and nowhere else.
 
 MIT for this plugin. The voices you install carry their own licences — see the
 table above.
+
+### Touch controls and browser audio
+
+On touch screens, Read aloud and voice recording use 48×48 px targets with
+22 px icons. Desktop toolbars keep their compact layout.
+
+Playback activates one Web Audio context inside the user's click, before
+requesting speech, and reuses it for every chunk. This preserves browser audio
+permission while synthesis is pending. Stop, microphone interruption, and
+resume still keep the position in the current chunk. Disabling or reloading the
+plugin closes its audio context and removes its styles and listeners.
+
+Browser behavior follows the [Web Audio activation guidance](https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API/Best_practices#autoplay_policy).
