@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-read-aloud",
-  "version": "0.1.0",
+  "version": "0.5.6",
   "type": "module",
   "engines": {
     "bb": ">=0.41",
@@ -10,17 +10,18 @@
     "name": "Read Aloud",
     "description": "Adds a Read aloud action to every chat message: hear an agent's answer, or just the part you highlighted, in a natural OpenAI voice.",
     "branding": {
-      "icon": "Volume2"
+      "icon": "Play"
     },
     "server": "./server.ts",
     "app": "./app.tsx",
-    "skills": []
+    "skills": [],
+    "host": "./host.ts"
   },
   "dependencies": {
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.4.34",
+    "@get-bb/plugin-sdk": "0.6.37",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
@@ -32,5 +33,11 @@
     "typescript": "^5.7.0"
   },
   "description": "Speak any BB chat message aloud with OpenAI text-to-speech.",
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "build": "env -u BB_CLI bb plugin build .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  }
 }
