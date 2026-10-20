@@ -61,8 +61,12 @@ export function normalizeForSpeech(text: string): string {
  */
 export const CHUNK_SIZE_RAMP = [180, 420, 900, 1500] as const;
 
-/** Keep each non-streaming speech response inside the gateway's 30 s budget. */
-export const OPENAI_CHUNK_SIZE_RAMP = [180, 420, 800] as const;
+/**
+ * OpenAI buffers each audio response before playback. In real Russian speech,
+ * a 360-character request exhausted the 25s deadline while <=180-character
+ * pieces completed in time. Keep this cap for every piece, not just startup.
+ */
+export const OPENAI_CHUNK_SIZE_RAMP = [180] as const;
 
 function limitFor(sizes: readonly number[], index: number): number {
   return sizes[Math.min(index, sizes.length - 1)]!;
@@ -92,14 +96,17 @@ export function splitForSpeech(
       window.lastIndexOf("? "),
       window.lastIndexOf("\n"),
     );
-    const cut = seam > limit * 0.5 ? seam + 1 : limit;
+    // When no sentence boundary is near enough, prefer a word boundary to
+    // hard-cutting a Russian word into separately synthesized syllables.
+    const wordSeam = window.lastIndexOf(" ");
+    const cut =
+      seam > limit * 0.5 ? seam + 1 : wordSeam > 0 ? wordSeam + 1 : limit;
     const piece = rest.slice(0, cut).trim();
     if (piece.length > 0) chunks.push(piece);
     rest = rest.slice(cut).trim();
   }
   return chunks;
 }
-
 
 /** Where an interrupted reading left off. */
 export interface PausedAt {

@@ -153,7 +153,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "OpenAI reading style",
       description:
-        "Plain-language direction, e.g. \"calm, unhurried\". Followed by gpt-4o-mini-tts only.",
+        'Plain-language direction, e.g. "calm, unhurried". Followed by gpt-4o-mini-tts only.',
       default: "Read clearly and naturally, at a calm pace.",
     },
   });
@@ -252,41 +252,57 @@ export default async function plugin(bb: BbPluginApi) {
     if (openaiModel === "gpt-4o-mini-tts" && openaiInstructions.trim()) {
       body.instructions = openaiInstructions.trim();
     }
-    const signal = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
-    try {
-      const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal,
-      });
-      if (!response.ok) {
-        // Never echo the response body: it can repeat the request content.
-        bb.log.error(`OpenAI speech failed: HTTP ${response.status}`);
-        throw new Error(
-          response.status === 401
-            ? "OpenAI rejected the key. Settings → Plugins → Read Aloud."
-            : response.status === 429
-              ? "OpenAI is rate limiting, or the account has no credit."
-              : `OpenAI returned HTTP ${response.status}.`,
-        );
-      }
-      const audio = Buffer.from(await response.arrayBuffer());
-      return {
-        audioBase64: audio.toString("base64"),
-        mimeType: "audio/mpeg",
-        cached: false,
-      };
-    } catch (cause) {
-      if (signal.aborted) {
+    // The overall RPC must still finish before the 30s public gateway limit.
+    // A fresh attempt recovers an intermittently stalled synthesis; simply
+    // waiting all 25s on the first request leaves no room for that recovery.
+    const deadline = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
+    const attemptBudgets = [8_000, 15_000] as const;
+    for (const [attempt, budget] of attemptBudgets.entries()) {
+      const signal = AbortSignal.any([deadline, AbortSignal.timeout(budget)]);
+      try {
+        if (signal.aborted) throw signal.reason;
+        const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+          signal,
+        });
+        if (!response.ok) {
+          // Never echo the response body: it can repeat the request content.
+          bb.log.error(`OpenAI speech failed: HTTP ${response.status}`);
+          throw new Error(
+            response.status === 401
+              ? "OpenAI rejected the key. Settings → Plugins → Read Aloud."
+              : response.status === 429
+                ? "OpenAI is rate limiting, or the account has no credit."
+                : `OpenAI returned HTTP ${response.status}.`,
+          );
+        }
+        const audio = Buffer.from(await response.arrayBuffer());
+        return {
+          audioBase64: audio.toString("base64"),
+          mimeType: "audio/mpeg",
+          cached: false,
+        };
+      } catch (cause) {
+        const timedOut =
+          signal.aborted ||
+          (cause instanceof Error && cause.name === "TimeoutError");
+        if (!timedOut) throw cause;
+        if (!deadline.aborted && attempt === 0) {
+          bb.log.warn(
+            "OpenAI speech attempt stalled; retrying the same fragment once",
+          );
+          continue;
+        }
         bb.log.warn("OpenAI speech exceeded the request time budget");
         throw new Error("Сервис озвучки не ответил вовремя. Попробуй ещё раз.");
       }
-      throw cause;
     }
+    throw new Error("Сервис озвучки не ответил вовремя. Попробуй ещё раз.");
   }
 
   bb.rpc.register(rpcContract, {
@@ -336,7 +352,9 @@ export default async function plugin(bb: BbPluginApi) {
       const { voice } = stored;
       const spoken = normalizeForSpeech(speakableText(text));
       if (spoken.length === 0) {
-        throw new Error("Nothing to read: this message is only code or images.");
+        throw new Error(
+          "Nothing to read: this message is only code or images.",
+        );
       }
       // Both routes start with a short piece. OpenAI buffers the whole audio
       // response here, so a large piece can outlast the gateway's timeout.
