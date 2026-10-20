@@ -41,12 +41,31 @@ export type Source = (typeof SOURCES)[number];
 
 export const rpcContract = defineRpcContract({
   requestChunk: {
-    input: z.object({chunk:z.string().min(1).max(MAX_CHUNK_CHARS),threadId:z.string().nullable(),format:z.enum(AUDIO_FORMATS),retryJobId:z.string().optional()}).strict(),
-    output: z.object({jobId:z.string()}).strict(),
+    input: z
+      .object({
+        chunk: z.string().min(1).max(MAX_CHUNK_CHARS),
+        threadId: z.string().nullable(),
+        format: z.enum(AUDIO_FORMATS),
+        retryJobId: z.string().optional(),
+      })
+      .strict(),
+    output: z.object({ jobId: z.string() }).strict(),
   },
   chunkStatus: {
-    input: z.object({jobId:z.string().min(1).max(200)}).strict(),
-    output: z.object({state:z.enum(['pending','ready','error']),audio:z.object({audioBase64:z.string(),mimeType:z.string(),cached:z.boolean()}).nullable(),message:z.string().nullable()}).strict(),
+    input: z.object({ jobId: z.string().min(1).max(200) }).strict(),
+    output: z
+      .object({
+        state: z.enum(["pending", "ready", "error"]),
+        audio: z
+          .object({
+            audioBase64: z.string(),
+            mimeType: z.string(),
+            cached: z.boolean(),
+          })
+          .nullable(),
+        message: z.string().nullable(),
+      })
+      .strict(),
   },
   /** Split a message into speakable pieces and confirm a route exists. */
   prepare: {
@@ -242,9 +261,16 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
 
-  async function speakViaOpenai(chunk: string, options: {background?:boolean;signal?:AbortSignal;configuration?:Awaited<ReturnType<typeof settings.get>>} = {}) {
+  async function speakViaOpenai(
+    chunk: string,
+    options: {
+      background?: boolean;
+      signal?: AbortSignal;
+      configuration?: Awaited<ReturnType<typeof settings.get>>;
+    } = {},
+  ) {
     const { openaiApiKey, openaiModel, openaiInstructions, voice, rate } =
-      options.configuration ?? await settings.get();
+      options.configuration ?? (await settings.get());
     const key = openaiApiKey.trim();
     if (key.length === 0) {
       throw new Error(
@@ -265,10 +291,18 @@ export default async function plugin(bb: BbPluginApi) {
     // The overall RPC must still finish before the 30s public gateway limit.
     // A fresh attempt recovers an intermittently stalled synthesis; simply
     // waiting all 25s on the first request leaves no room for that recovery.
-    const deadline = AbortSignal.timeout(options.background ? 60_000 : OPENAI_TIMEOUT_MS);
-    const attemptBudgets = options.background ? [20_000, 35_000] : [8_000, 15_000];
+    const deadline = AbortSignal.timeout(
+      options.background ? 60_000 : OPENAI_TIMEOUT_MS,
+    );
+    const attemptBudgets = options.background
+      ? [20_000, 35_000]
+      : [8_000, 15_000];
     for (const [attempt, budget] of attemptBudgets.entries()) {
-      const signal = AbortSignal.any([deadline, AbortSignal.timeout(budget), ...(options.signal ? [options.signal] : [])]);
+      const signal = AbortSignal.any([
+        deadline,
+        AbortSignal.timeout(budget),
+        ...(options.signal ? [options.signal] : []),
+      ]);
       try {
         if (signal.aborted) throw signal.reason;
         const response = await fetch(OPENAI_SPEECH_ENDPOINT, {
@@ -319,18 +353,41 @@ export default async function plugin(bb: BbPluginApi) {
   const jobs = new SpeechJobs();
   bb.onDispose(() => jobs.dispose());
   bb.rpc.register(rpcContract, {
-    async requestChunk({chunk,threadId,format,retryJobId}) {
+    async requestChunk({ chunk, threadId, format, retryJobId }) {
       const stored = await settings.get();
       const source = parseSource(stored.source);
       // Never hash/log credentials. These fields define the audio rendition.
-      const key = createHash('sha256').update(JSON.stringify([chunk,threadId,format,source,stored.voice,stored.rate,stored.openaiModel,stored.openaiInstructions,stored.engineUrl,stored.machineId])).digest('hex');
-      const jobId = jobs.request(key, signal => source === 'openai'
-        ? speakViaOpenai(chunk,{background:true,signal,configuration:stored})
-        : speakLocally(chunk,threadId,format));
+      const key = createHash("sha256")
+        .update(
+          JSON.stringify([
+            chunk,
+            threadId,
+            format,
+            source,
+            stored.voice,
+            stored.rate,
+            stored.openaiModel,
+            stored.openaiInstructions,
+            stored.engineUrl,
+            stored.machineId,
+          ]),
+        )
+        .digest("hex");
+      const jobId = jobs.request(key, (signal) =>
+        source === "openai"
+          ? speakViaOpenai(chunk, {
+              background: true,
+              signal,
+              configuration: stored,
+            })
+          : speakLocally(chunk, threadId, format),
+      );
       if (retryJobId === jobId) jobs.retry(jobId);
-      return {jobId};
+      return { jobId };
     },
-    async chunkStatus({jobId}) { return jobs.status(jobId); },
+    async chunkStatus({ jobId }) {
+      return jobs.status(jobId);
+    },
     async status({ threadId }) {
       const stored = await settings.get();
       const source = parseSource(stored.source);

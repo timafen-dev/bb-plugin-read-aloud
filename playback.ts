@@ -26,7 +26,8 @@ export function disposePlayback(): void {
 
 export async function decodePlayback(bytes: Uint8Array): Promise<AudioBuffer> {
   const clock = context;
-  if (clock === null) throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
+  if (clock === null)
+    throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
   return clock.decodeAudioData(bytes.slice().buffer);
 }
 
@@ -42,7 +43,8 @@ export class ChunkPlayback {
   get currentTime(): number {
     return Math.min(
       this.duration,
-      this.offset + (this.clock === null ? 0 : this.clock.currentTime - this.startedAt),
+      this.offset +
+        (this.clock === null ? 0 : this.clock.currentTime - this.startedAt),
     );
   }
 
@@ -66,7 +68,8 @@ export class ChunkPlayback {
 
   async playBuffer(buffer: AudioBuffer, startAt = 0): Promise<void> {
     const clock = context;
-    if (clock === null) throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
+    if (clock === null)
+      throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
     if (activation !== null) await activation;
     if (this.cancelled) return;
     if (clock.state !== "running") {

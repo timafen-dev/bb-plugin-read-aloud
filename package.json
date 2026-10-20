@@ -23,12 +23,14 @@
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.37",
     "@types/better-sqlite3": "^7.6.13",
+    "@types/jsdom": "^21.1.7",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "better-sqlite3": "^12.11.1",
     "cron-parser": "^5.10.0",
     "hono": "^4.13.7",
+    "jsdom": "^26.1.0",
     "sonner": "^1.7.4",
     "typescript": "^5.7.0"
   },

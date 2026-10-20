@@ -15,8 +15,17 @@ import { useEffect, useState } from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server.ts";
-import { type PausedAt, resumePoint } from "./text.ts";
-import { activatePlayback, ChunkPlayback, disposePlayback } from "./playback.ts";
+import { speakableText } from "./text.ts";
+import { ReadingSession } from "./reading-session.ts";
+import { mountPlayer, type PlayerView } from "./player-view.ts";
+import { ChunkClient } from "./chunk-client.ts";
+import type { ChunkAudio } from "./speech-jobs.ts";
+import {
+  activatePlayback,
+  ChunkPlayback,
+  decodePlayback,
+  disposePlayback,
+} from "./playback.ts";
 
 const PLUGIN_ID = "read-aloud";
 const RPC_URL = `/api/v1/plugins/${PLUGIN_ID}/rpc`;
@@ -24,12 +33,6 @@ const ACTION_TITLE = "Read aloud";
 const PLAYING_ATTRIBUTE = "data-read-aloud-playing";
 
 type AudioFormat = "opus" | "mp3" | "wav";
-
-interface ChunkAudio {
-  audioBase64: string;
-  mimeType: string;
-  cached: boolean;
-}
 
 /**
  * Safari on iOS does not play ogg/opus. Ask the browser rather than sniffing
@@ -40,11 +43,19 @@ function preferredFormat(): AudioFormat {
   return probe.canPlayType('audio/ogg; codecs="opus"') !== "" ? "opus" : "mp3";
 }
 
-async function rpc<T>(method: string, input: unknown): Promise<T> {
+async function rpc<T>(
+  method: string,
+  input: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch(`${RPC_URL}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
+    signal: AbortSignal.any([
+      AbortSignal.timeout(10_000),
+      ...(signal ? [signal] : []),
+    ]),
   });
   const payload: unknown = await response.json().catch(() => null);
   const asRecord =
@@ -69,110 +80,108 @@ function audioBytes({ audioBase64 }: ChunkAudio): Uint8Array {
 /** The button the user actually pressed, so the ■ lands on the right message. */
 let pressedButton: HTMLElement | null = null;
 
-function markPlaying(playing: boolean): void {
-  if (pressedButton === null) return;
-  if (playing) pressedButton.setAttribute(PLAYING_ATTRIBUTE, "true");
-  else pressedButton.removeAttribute(PLAYING_ATTRIBUTE);
+interface SessionRecord {
+  key: string;
+  session: ReadingSession;
+  client: ChunkClient;
+  view: PlayerView | null;
+  button: HTMLElement | null;
+  anchor: HTMLElement | null;
+  rowId: string | null;
+  columnIndex: number;
+  wantedPanel: boolean;
+  unsubscribe: () => void;
 }
+const sessions = new Map<string, SessionRecord>();
+let active: SessionRecord | null = null;
+let actionGeneration = 0;
+let pressedAt = 0;
 
-/**
- * Where a reading was interrupted, so pressing ▶ again continues instead of
- * starting over. A long answer stopped for a voice message is the case this
- * exists for; the decision itself lives in text.ts, where it is tested.
- */
-let paused: PausedAt | null = null;
-
-/** One reading at a time across the whole app. */
-class Reading {
-  private audio: ChunkPlayback | null = null;
-  private cancelled = false;
-  private button: HTMLElement | null = pressedButton;
-  private chunks: string[] = [];
-  private index = 0;
-  private threadId = "";
-  private format: AudioFormat = "mp3";
-
-  constructor(readonly messageId: string) {}
-
-  /**
-   * `remember` separates the two ways a reading ends. Interrupted — by the
-   * button or by the microphone — keeps the place. Finished, or failed, has no
-   * place worth keeping.
-   */
-  cancel(remember = false): void {
-    this.cancelled = true;
-    if (remember && this.audio !== null && this.chunks.length > 0) {
-      paused = {
-        messageId: this.messageId,
-        chunks: this.chunks,
-        index: this.index,
-        offset: this.audio.currentTime,
-        threadId: this.threadId,
-        format: this.format,
-      };
-    }
-    if (this.audio !== null) {
-      this.audio.stop();
-      this.audio = null;
-    }
-    this.button?.removeAttribute(PLAYING_ATTRIBUTE);
-  }
-
-  get stopped(): boolean {
-    return this.cancelled;
-  }
-
-  private playOne(audio: ChunkAudio, startAt = 0): Promise<void> {
-    const playback = new ChunkPlayback();
-    this.audio = playback;
-    return playback.play(audioBytes(audio), startAt);
-  }
-
-  /**
-   * Synthesize one piece ahead of the one playing: the queue never runs dry,
-   * and no more than two pieces are ever in flight.
-   */
-  async run(
-    chunks: string[],
-    threadId: string,
-    format: AudioFormat,
-    from = 0,
-    offset = 0,
-    firstAudio: ChunkAudio | null = null,
-  ): Promise<void> {
-    this.chunks = chunks;
-    this.threadId = threadId;
-    this.format = format;
-    const fetchChunk = (chunk: string) =>
-      rpc<ChunkAudio>("speakChunk", { chunk, threadId, format });
-
-    // The opening piece usually arrives with the split, already synthesized.
-    // Resuming re-requests the piece it left off in; the engine caches by the
-    // text, so that costs a millisecond rather than a fresh synthesis.
-    let pending =
-      firstAudio !== null ? Promise.resolve(firstAudio) : fetchChunk(chunks[from]!);
-    for (let index = from; index < chunks.length; index += 1) {
-      this.index = index;
-      const audio = await pending;
-      if (this.cancelled) return;
-      const next = chunks[index + 1];
-      pending = next === undefined ? pending : fetchChunk(next);
-      // Prefetch can fail while the current piece is still speaking.
-      void pending.catch(() => {});
-      await this.playOne(audio, index === from ? offset : 0);
-      if (this.cancelled) return;
-    }
-    // Reaching the end means there is nothing left to resume.
-    if (paused?.messageId === this.messageId) paused = null;
-  }
+function stopReading(): void {
+  active?.session.pause();
 }
-
-let active: Reading | null = null;
-
-function stopReading(remember = true): void {
-  active?.cancel(remember);
-  active = null;
-  markPlaying(false);
+function focusRecord(record: SessionRecord): void {
+  activatePlayback();
+  if (active !== record) active?.session.pause();
+  active = record;
+}
+function disposeRecord(record: SessionRecord): void {
+  record.unsubscribe();
+  record.view?.dispose();
+  record.client.dispose();
+  record.session.dispose();
+  record.button?.removeAttribute(PLAYING_ATTRIBUTE);
+}
+function anchorFromColumn(column: HTMLElement | null): HTMLElement | null {
+  return (
+    column?.querySelector<HTMLElement>(":scope > .relative.w-full") ?? null
+  );
+}
+function findAnchor(text: string): HTMLElement | null {
+  if (pressedButton?.isConnected && Date.now() - pressedAt < 2000) {
+    const slot = pressedButton.parentElement?.parentElement;
+    if (slot?.classList.contains("relative")) return slot;
+  }
+  const selected = document.getSelection()?.anchorNode;
+  const element =
+    selected instanceof Element ? selected : selected?.parentElement;
+  const selectionColumn =
+    element?.closest<HTMLElement>("[data-message-column]") ?? null;
+  if (selectionColumn) return anchorFromColumn(selectionColumn);
+  const preview = speakableText(text).replace(/\s+/gu, " ").slice(0, 70);
+  const column = Array.from(
+    document.querySelectorAll<HTMLElement>("[data-message-column]"),
+  ).find(
+    (c) => preview && c.textContent?.replace(/\s+/gu, " ").includes(preview),
+  );
+  return anchorFromColumn(column ?? null);
+}
+function showPlayer(record: SessionRecord, anchor: HTMLElement): void {
+  for (const other of sessions.values()) {
+    if (other !== record && other.anchor === anchor) {
+      other.wantedPanel = false;
+      other.view?.dispose();
+      other.view = null;
+    }
+  }
+  record.anchor = anchor;
+  record.wantedPanel = true;
+  const column = anchor.closest<HTMLElement>("[data-message-column]");
+  const row = anchor.closest<HTMLElement>("[data-timeline-row-id]");
+  record.rowId = row?.dataset.timelineRowId ?? null;
+  record.columnIndex =
+    row && column
+      ? Array.from(row.querySelectorAll("[data-message-column]")).indexOf(
+          column,
+        )
+      : 0;
+  record.button =
+    anchor.querySelector<HTMLElement>(`button[aria-label="${ACTION_TITLE}"]`) ??
+    record.button;
+  if (record.view) record.view.move(anchor);
+  else
+    record.view = mountPlayer(anchor, record.session, {
+      activate: () => focusRecord(record),
+    });
+}
+function restorePanels(): void {
+  for (const record of sessions.values()) {
+    if (
+      !record.wantedPanel ||
+      record.view?.element.isConnected ||
+      !record.rowId
+    )
+      continue;
+    const row = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-timeline-row-id]"),
+    ).find((r) => r.dataset.timelineRowId === record.rowId);
+    const column =
+      row?.querySelectorAll<HTMLElement>("[data-message-column]")[
+        record.columnIndex
+      ] ?? null;
+    const anchor = anchorFromColumn(column);
+    if (anchor) showPlayer(record, anchor);
+  }
 }
 
 /** Live engine state for the settings page, so the active voice is visible. */
@@ -226,67 +235,89 @@ export default definePluginApp((app) => {
     title: ACTION_TITLE,
     icon: "Play",
     async run({ threadId, message, selectedText }) {
-      const wasReading = active;
-      stopReading();
-      // Pressing the message that is speaking stops it — and the place is
-      // kept, so the next press continues from there.
-      if (
-        wasReading !== null &&
-        wasReading.messageId === message.id &&
-        (selectedText ?? "").length === 0
-      ) {
-        return;
-      }
-
+      const generation = ++actionGeneration;
       const selection = (selectedText ?? "").trim();
       const text = selection || message.text;
-      if (text.trim().length === 0) return;
-
-      // Also covers the selection menu, which has no message Play button.
-      const reading = new Reading(message.id);
-      active = reading;
-      markPlaying(true);
-      let finished = false;
+      if (!text.trim()) return;
+      const key = JSON.stringify([threadId, message.id, text]);
+      const anchor = findAnchor(text);
+      const previous = sessions.get(key);
+      if (previous) {
+        if (anchor) showPlayer(previous, anchor);
+        const state = previous.session.snapshot().state;
+        if (
+          active === previous &&
+          (state === "playing" || state === "buffering")
+        )
+          previous.session.pause();
+        else {
+          focusRecord(previous);
+          previous.session.play();
+        }
+        return;
+      }
+      stopReading();
+      const button = pressedButton;
+      button?.setAttribute(PLAYING_ATTRIBUTE, "true");
       try {
         activatePlayback();
-        const format = preferredFormat();
-        const resume = resumePoint(paused, message.id, selection, format);
-        // Starting fresh asks for the audio of the first piece in the same
-        // call as the split; resuming does not, because the piece it needs is
-        // somewhere in the middle.
-        let chunks = resume?.chunks;
-        let firstAudio: ChunkAudio | null = null;
-        if (chunks === undefined) {
-          const prepared = await rpc<{
-            chunks: string[];
-            first: ChunkAudio | null;
-          }>("prepare", { text, threadId, format });
-          chunks = prepared.chunks;
-          firstAudio = prepared.first;
-        }
-        if (reading.stopped) return;
-        if (chunks.length === 0) throw new Error("Nothing to read.");
-        paused = null;
-        await reading.run(
-          chunks,
+        // Split only: no UI HTTP request waits for synthesis.
+        const prepared = await rpc<{ chunks: string[] }>("prepare", {
+          text,
           threadId,
-          format,
-          resume?.index ?? 0,
-          resume?.offset ?? 0,
-          firstAudio,
+        });
+        if (generation !== actionGeneration) return;
+        if (!prepared.chunks.length) throw new Error("Nothing to read.");
+        const format = preferredFormat();
+        const client = new ChunkClient((method, input, signal) =>
+          rpc(method, input, signal),
         );
-        finished = true;
-      } catch (cause) {
-        // Errors are the one thing worth interrupting for; progress is not.
-        toast.error(cause instanceof Error ? cause.message : String(cause));
-      } finally {
-        if (active === reading) {
-          // Only a real interruption is worth resuming from; finishing and
-          // failing both leave nothing behind.
-          reading.cancel(false);
-          active = null;
+        const session = new ReadingSession(prepared.chunks, {
+          synthesize: (index, retry) =>
+            client.get(prepared.chunks[index]!, threadId, format, retry),
+          decode: (audio) => decodePlayback(audioBytes(audio)),
+          createPlayback: () => {
+            const playback = new ChunkPlayback();
+            return {
+              get currentTime() {
+                return playback.currentTime;
+              },
+              stop: () => playback.stop(),
+              play: (buffer, offset) => playback.playBuffer(buffer, offset),
+            };
+          },
+        });
+        const record: SessionRecord = {
+          key,
+          session,
+          client,
+          view: null,
+          button,
+          anchor: null,
+          rowId: null,
+          columnIndex: 0,
+          wantedPanel: true,
+          unsubscribe: () => {},
+        };
+        record.unsubscribe = session.subscribe(() => {
+          const state = session.snapshot().state;
+          if (state === "playing" || state === "buffering")
+            record.button?.setAttribute(PLAYING_ATTRIBUTE, "true");
+          else record.button?.removeAttribute(PLAYING_ATTRIBUTE);
+        });
+        sessions.set(key, record);
+        if (anchor) showPlayer(record, anchor);
+        focusRecord(record);
+        session.play();
+        while (sessions.size > 3) {
+          const older = [...sessions.values()].find((r) => r !== active);
+          if (!older) break;
+          sessions.delete(older.key);
+          disposeRecord(older);
         }
-        if (!finished) markPlaying(false);
+      } catch (cause) {
+        button?.removeAttribute(PLAYING_ATTRIBUTE);
+        toast.error(cause instanceof Error ? cause.message : String(cause));
       }
     },
   });
@@ -370,8 +401,8 @@ export default definePluginApp((app) => {
       document.head.append(style);
 
       const isReadAloudButton = (element: Element): boolean =>
-        (element.getAttribute("aria-label") ?? element.getAttribute("title")) ===
-        ACTION_TITLE;
+        (element.getAttribute("aria-label") ??
+          element.getAttribute("title")) === ACTION_TITLE;
 
       // The click that triggers `run` passes here first, so the element the
       // user pressed is known before the reading starts.
@@ -379,11 +410,31 @@ export default definePluginApp((app) => {
         const button = (event.target as Element | null)?.closest?.("button");
         if (button && isReadAloudButton(button)) {
           pressedButton = button;
+          pressedAt = Date.now();
           // Capture runs inside the trusted user gesture, before any SDK/RPC wait.
-          try { activatePlayback(); } catch { /* run reports a playback error */ }
+          try {
+            activatePlayback();
+          } catch {
+            /* run reports a playback error */
+          }
         }
       };
       document.addEventListener("click", onClick, true);
+      let restoreTimer: ReturnType<typeof setTimeout> | null = null;
+      const observer = new MutationObserver(() => {
+        if (
+          restoreTimer !== null ||
+          ![...sessions.values()].some(
+            (r) => r.wantedPanel && !r.view?.element.isConnected,
+          )
+        )
+          return;
+        restoreTimer = setTimeout(() => {
+          restoreTimer = null;
+          restorePanels();
+        }, 100);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
 
       // Recording and playback at once is never wanted: the microphone would
       // hear the reading. Patching getUserMedia catches every way the app can
@@ -402,8 +453,13 @@ export default definePluginApp((app) => {
         if (originalGetUserMedia && media) {
           media.getUserMedia = originalGetUserMedia;
         }
+        observer.disconnect();
+        if (restoreTimer !== null) clearTimeout(restoreTimer);
         style.remove();
-        stopReading();
+        actionGeneration++;
+        for (const record of sessions.values()) disposeRecord(record);
+        sessions.clear();
+        active = null;
         disposePlayback();
       };
     },
