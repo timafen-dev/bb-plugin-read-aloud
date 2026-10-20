@@ -24,6 +24,12 @@ export function disposePlayback(): void {
   }
 }
 
+export async function decodePlayback(bytes: Uint8Array): Promise<AudioBuffer> {
+  const clock = context;
+  if (clock === null) throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
+  return clock.decodeAudioData(bytes.slice().buffer);
+}
+
 export class ChunkPlayback {
   private source: AudioBufferSourceNode | null = null;
   private startedAt = 0;
@@ -54,6 +60,11 @@ export class ChunkPlayback {
   }
 
   async play(bytes: Uint8Array, startAt = 0): Promise<void> {
+    const buffer = await decodePlayback(bytes);
+    if (!this.cancelled) await this.playBuffer(buffer, startAt);
+  }
+
+  async playBuffer(buffer: AudioBuffer, startAt = 0): Promise<void> {
     const clock = context;
     if (clock === null) throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
     if (activation !== null) await activation;
@@ -62,8 +73,7 @@ export class ChunkPlayback {
       throw new Error("Браузер приостановил звук. Нажми Play ещё раз.");
     }
     this.clock = clock;
-    // A private ArrayBuffer also works when the original bytes use shared backing.
-    const buffer = await clock.decodeAudioData(bytes.slice().buffer);
+    // The same decoded rendition is reused when seeking and resuming.
     if (this.cancelled) return;
     this.offset = Math.min(Math.max(0, startAt), buffer.duration);
     this.duration = buffer.duration;
