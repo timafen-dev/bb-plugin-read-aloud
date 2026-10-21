@@ -67,6 +67,9 @@ export class ChunkPlayback {
   }
 
   async playBuffer(buffer: AudioBuffer, startAt = 0): Promise<void> {
+    // Preserve the requested position even while activation waits or fails.
+    this.offset = Math.min(Math.max(0, startAt), buffer.duration);
+    this.duration = buffer.duration;
     const clock = context;
     if (clock === null)
       throw new Error("Нажми Play ещё раз, чтобы разрешить звук.");
@@ -78,8 +81,6 @@ export class ChunkPlayback {
     this.clock = clock;
     // The same decoded rendition is reused when seeking and resuming.
     if (this.cancelled) return;
-    this.offset = Math.min(Math.max(0, startAt), buffer.duration);
-    this.duration = buffer.duration;
     if (this.offset >= this.duration) return;
     const source = clock.createBufferSource();
     source.buffer = buffer;

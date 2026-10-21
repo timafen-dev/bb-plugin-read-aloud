@@ -96,8 +96,17 @@ const sessions = new Map<string, SessionRecord>();
 let active: SessionRecord | null = null;
 let actionGeneration = 0;
 let pressedAt = 0;
+const pendingButtons = new Set<HTMLElement>();
+
+function invalidatePreparation(): void {
+  actionGeneration++;
+  for (const button of pendingButtons)
+    button.removeAttribute(PLAYING_ATTRIBUTE);
+  pendingButtons.clear();
+}
 
 function stopReading(): void {
+  invalidatePreparation();
   active?.session.pause();
 }
 function focusRecord(record: SessionRecord): void {
@@ -235,7 +244,8 @@ export default definePluginApp((app) => {
     title: ACTION_TITLE,
     icon: "Play",
     async run({ threadId, message, selectedText }) {
-      const generation = ++actionGeneration;
+      invalidatePreparation();
+      const generation = actionGeneration;
       const selection = (selectedText ?? "").trim();
       const text = selection || message.text;
       if (!text.trim()) return;
@@ -256,8 +266,9 @@ export default definePluginApp((app) => {
         }
         return;
       }
-      stopReading();
+      active?.session.pause();
       const button = pressedButton;
+      if (button) pendingButtons.add(button);
       button?.setAttribute(PLAYING_ATTRIBUTE, "true");
       try {
         activatePlayback();
@@ -316,8 +327,12 @@ export default definePluginApp((app) => {
           disposeRecord(older);
         }
       } catch (cause) {
+        if (generation !== actionGeneration) return;
         button?.removeAttribute(PLAYING_ATTRIBUTE);
         toast.error(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        if (generation === actionGeneration && button)
+          pendingButtons.delete(button);
       }
     },
   });
